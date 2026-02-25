@@ -177,37 +177,25 @@ runs:
           API_URL="https://nbfspfjbqggsrsslkrxx.supabase.co/functions/v1/ci-scan"
         fi
 
-        echo "Sending to $API_URL ..."
-        echo "Payload size: $(wc -c < /tmp/zf_payload.json) bytes"
-
-        # DNS check
-        SUPABASE_HOST=$(echo "$API_URL" | sed 's|https\?://||' | cut -d/ -f1)
-        echo "Resolving $SUPABASE_HOST ..."
-        nslookup "$SUPABASE_HOST" || echo "DNS lookup failed for $SUPABASE_HOST"
-
         for attempt in 1 2 3; do
           set +e
-          HTTP_CODE=$(curl -sS -o /tmp/scan_result.json -w "%{http_code}" \
+          HTTP_CODE=$(curl -s -o /tmp/scan_result.json -w "%{http_code}" \
             -X POST "$API_URL" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $ZERIFLOW_API_KEY" \
             -d @/tmp/zf_payload.json \
-            --max-time 120 2>&1)
+            --max-time 120)
           CURL_EXIT=$?
           set -e
 
-          echo "Attempt $attempt: curl exit=$CURL_EXIT response=$HTTP_CODE"
-
           if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "curl failed with exit code $CURL_EXIT"
-            cat /tmp/scan_result.json 2>/dev/null || true
-            if [ "$attempt" -lt 3 ]; then
-              sleep 5
-              continue
-            fi
-            echo "::error::ZeriFlow API unreachable after 3 attempts (curl exit $CURL_EXIT)"
+            echo "Attempt $attempt: connection failed (exit $CURL_EXIT)"
+            if [ "$attempt" -lt 3 ]; then sleep 5; continue; fi
+            echo "::error::ZeriFlow API unreachable after 3 attempts"
             exit 1
           fi
+
+          echo "Attempt $attempt: HTTP $HTTP_CODE"
 
           if [ "$HTTP_CODE" = "200" ]; then
             break
