@@ -47,7 +47,6 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    # Step 1: Install static analysis tools
     - name: Install Semgrep
       shell: bash
       run: pip install semgrep --quiet 2>/dev/null
@@ -58,23 +57,19 @@ runs:
         GITLEAKS_VERSION="8.18.2"
         curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar xz -C /usr/local/bin gitleaks 2>/dev/null || echo "Gitleaks install failed, continuing without it"
 
-    # Step 2: Collect PR diff
     - name: Collect PR diff
       id: diff
       shell: bash
       run: |
         BASE_SHA="${{ github.event.pull_request.base.sha }}"
         HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
         if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
-          echo "Not a pull request event, using last commit diff"
           BASE_SHA="HEAD~1"
           HEAD_SHA="HEAD"
         fi
-
         git diff --name-only "$BASE_SHA"..."$HEAD_SHA" 2>/dev/null > /tmp/changed_files.txt || git diff --name-only HEAD~1 > /tmp/changed_files.txt
 
-        node -e "
+        node <<'NODESCRIPT'
         const fs = require('fs');
         const files = fs.readFileSync('/tmp/changed_files.txt', 'utf8').trim().split('\n').filter(Boolean);
         const diff_files = [];
@@ -89,20 +84,17 @@ runs:
         }
         fs.writeFileSync('/tmp/diff_files.json', JSON.stringify(diff_files));
         console.log('Files collected: ' + diff_files.length);
-        "
+        NODESCRIPT
 
-    # Step 3: Run static analysis
     - name: Run Semgrep
       shell: bash
       continue-on-error: true
-      run: |
-        semgrep scan --config auto --json --quiet > /tmp/semgrep_results.json 2>/dev/null || echo '{"results":[]}' > /tmp/semgrep_results.json
+      run: semgrep scan --config auto --json --quiet > /tmp/semgrep_results.json 2>/dev/null || echo '{"results":[]}' > /tmp/semgrep_results.json
 
     - name: Run Gitleaks
       shell: bash
       continue-on-error: true
-      run: |
-        gitleaks detect --source . --report-format json --report-path /tmp/gitleaks_results.json --no-banner 2>/dev/null || echo '[]' > /tmp/gitleaks_results.json
+      run: gitleaks detect --source . --report-format json --report-path /tmp/gitleaks_results.json --no-banner 2>/dev/null || echo '[]' > /tmp/gitleaks_results.json
 
     - name: Run npm audit
       shell: bash
@@ -114,7 +106,6 @@ runs:
           echo '{}' > /tmp/npm_audit_results.json
         fi
 
-    # Step 4: Detect framework
     - name: Detect framework
       id: framework
       shell: bash
@@ -125,13 +116,10 @@ runs:
             const deps = {...(pkg.dependencies||{}), ...(pkg.devDependencies||{})};
             if (deps['next']) console.log('nextjs');
             else if (deps['nuxt']) console.log('nuxt');
-            else if (deps['@sveltejs/kit']) console.log('sveltekit');
             else if (deps['react']) console.log('react');
             else if (deps['vue']) console.log('vue');
             else if (deps['express']) console.log('express');
             else if (deps['fastify']) console.log('fastify');
-            else if (deps['django']) console.log('django');
-            else if (deps['flask']) console.log('flask');
             else console.log('unknown');
           " 2>/dev/null || echo "unknown")
           echo "framework=$FRAMEWORK" >> "$GITHUB_OUTPUT"
@@ -144,25 +132,32 @@ runs:
           echo "framework=unknown" >> "$GITHUB_OUTPUT"
         fi
 
-    # Step 5: Send to ZeriFlow API
-    - name: Send to ZeriFlow
+    - name: Build payload and send to ZeriFlow
       id: scan
       shell: bash
       env:
         ZERIFLOW_API_KEY: ${{ inputs.api-key }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        BRANCH: ${{ github.head_ref || github.ref_name }}
+        FRAMEWORK: ${{ steps.framework.outputs.framework }}
+        GITHUB_OUTPUT_FILE: ${{ github.output }}
       run: |
-        PR_TITLE="${{ github.event.pull_request.title }}"
-        PR_TITLE_ESCAPED=$(node -e "process.stdout.write(JSON.stringify(process.argv[1]))" -- "$PR_TITLE")
-
-        PAYLOAD=$(node -e "
+        node <<'NODESCRIPT'
         const fs = require('fs');
+        const { execSync } = require('child_process');
+
+        // Build payload entirely in Node (no bash variable expansion issues)
         let pkgJson = null;
         try { pkgJson = JSON.parse(fs.readFileSync('package.json', 'utf8')); } catch {}
+
         const payload = {
-          pr_number: ${{ github.event.pull_request.number || 0 }},
-          pr_title: $PR_TITLE_ESCAPED,
-          commit_sha: '${{ github.event.pull_request.head.sha || github.sha }}',
-          branch: '${{ github.head_ref || github.ref_name }}',
+          pr_number: parseInt(process.env.PR_NUMBER) || 0,
+          pr_title: process.env.PR_TITLE || '',
+          commit_sha: process.env.COMMIT_SHA || '',
+          branch: process.env.BRANCH || '',
           diff_files: JSON.parse(fs.readFileSync('/tmp/diff_files.json', 'utf8')),
           static_findings: {
             semgrep: JSON.parse(fs.readFileSync('/tmp/semgrep_results.json', 'utf8')),
@@ -170,126 +165,134 @@ runs:
             npm_audit: JSON.parse(fs.readFileSync('/tmp/npm_audit_results.json', 'utf8'))
           },
           package_json: pkgJson,
-          framework_detected: '${{ steps.framework.outputs.framework }}'
+          framework_detected: process.env.FRAMEWORK || 'unknown'
         };
-        process.stdout.write(JSON.stringify(payload));
-        ")
 
-        API_URL="${{ inputs.api-url }}"
+        fs.writeFileSync('/tmp/zf_payload.json', JSON.stringify(payload));
+        console.log('Payload built: ' + JSON.stringify(payload).length + ' bytes');
+        NODESCRIPT
+
+        API_URL="${INPUT_API_URL}"
         if [ -z "$API_URL" ]; then
           API_URL="https://nkkfvjqcbniylnwmviyf.supabase.co/functions/v1/ci-scan"
         fi
 
+        echo "Sending to $API_URL ..."
+
         for attempt in 1 2 3; do
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
+          HTTP_CODE=$(curl -s -o /tmp/scan_result.json -w "%{http_code}" \
             -X POST "$API_URL" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $ZERIFLOW_API_KEY" \
-            -d "$PAYLOAD" \
+            -d @/tmp/zf_payload.json \
             --max-time 120)
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "Attempt $attempt: HTTP $HTTP_CODE"
 
           if [ "$HTTP_CODE" = "200" ]; then
-            echo "$BODY" > /tmp/scan_result.json
             break
           elif [ "$HTTP_CODE" = "402" ]; then
             echo "::error::No CI/CD scans remaining. Buy tokens at https://zeriflow.com/pricing"
             exit 1
-          elif [ "$attempt" -lt 3 ]; then
-            echo "Attempt $attempt failed (HTTP $HTTP_CODE), retrying in 10s..."
+          elif [ "$attempt" -lt 3 ] && [ "$HTTP_CODE" -ge "500" ] 2>/dev/null; then
+            echo "Server error, retrying in 10s..."
             sleep 10
           else
-            echo "::error::ZeriFlow scan failed after 3 attempts (HTTP $HTTP_CODE): $BODY"
+            BODY=$(cat /tmp/scan_result.json 2>/dev/null || echo "no response")
+            echo "::error::ZeriFlow scan failed (HTTP $HTTP_CODE): $BODY"
             exit 1
           fi
         done
 
-        SCORE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')).score || 0)")
-        PASSED=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')).passed || false)")
-        CRITICAL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')).critical_count || 0)")
-        WARNING=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')).warning_count || 0)")
-        SCAN_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')).scan_id || '')")
+        node <<'NODESCRIPT'
+        const fs = require('fs');
+        const r = JSON.parse(fs.readFileSync('/tmp/scan_result.json', 'utf8'));
+        const out = process.env.GITHUB_OUTPUT;
+        const lines = [
+          `score=${r.score || 0}`,
+          `passed=${r.passed || false}`,
+          `critical-count=${r.critical_count || 0}`,
+          `warning-count=${r.warning_count || 0}`,
+          `scan-id=${r.scan_id || ''}`
+        ];
+        fs.appendFileSync(out, lines.join('\n') + '\n');
+        console.log('Score: ' + (r.score || 0) + '/100 — ' + (r.passed ? 'PASSED' : 'FAILED'));
+        NODESCRIPT
 
-        echo "score=$SCORE" >> "$GITHUB_OUTPUT"
-        echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
-        echo "critical-count=$CRITICAL" >> "$GITHUB_OUTPUT"
-        echo "warning-count=$WARNING" >> "$GITHUB_OUTPUT"
-        echo "scan-id=$SCAN_ID" >> "$GITHUB_OUTPUT"
-
-    # Step 6: Post PR comment
     - name: Post PR comment
       if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
       run: |
-        RESULT=$(cat /tmp/scan_result.json)
+        node <<'NODESCRIPT'
+        const fs = require('fs');
+        const { execSync } = require('child_process');
 
-        SCORE=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.score||0))")
-        PASSED=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.passed||false))")
-        CRITICAL=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.critical_count||0))")
-        WARNING=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.warning_count||0))")
-        INFO=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.info_count||0))")
-        SUMMARY=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(r.summary||'')")
-        THRESHOLD=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(String(r.threshold||60))")
-        SCAN_ID=$(node -e "const r=JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8')); process.stdout.write(r.scan_id||'')")
+        const r = JSON.parse(fs.readFileSync('/tmp/scan_result.json', 'utf8'));
+        const score = r.score || 0;
+        const passed = r.passed || false;
+        const critical = r.critical_count || 0;
+        const warning = r.warning_count || 0;
+        const info = r.info_count || 0;
+        const summary = r.summary || '';
+        const threshold = r.threshold || 60;
+        const scanId = r.scan_id || '';
+        const statusIcon = passed ? '✅' : '❌';
+        const statusText = passed ? 'PASSED' : 'FAILED';
 
-        if [ "$PASSED" = "true" ]; then
-          STATUS_ICON="✅"
-          STATUS_TEXT="PASSED"
-        else
-          STATUS_ICON="❌"
-          STATUS_TEXT="FAILED"
-        fi
-
-        FINDINGS_MD=$(node -e "
-        const r = JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8'));
         const findings = r.findings || [];
-        if (findings.length === 0) { process.stdout.write('No issues found!'); process.exit(); }
         const icons = { critical: '🔴', warning: '🟡', info: '🔵' };
-        const lines = findings.slice(0, 20).map(f =>
-          (icons[f.severity] || '⚪') + ' **' + (f.severity||'info').toUpperCase() + '**: ' + f.title + ' (\`' + f.file + (f.line ? ':' + f.line : '') + '\`)'
-        );
-        if (findings.length > 20) lines.push('... and ' + (findings.length - 20) + ' more');
-        process.stdout.write(lines.join('\n'));
-        ")
+        let findingsMd = 'No issues found!';
+        if (findings.length > 0) {
+          const lines = findings.slice(0, 20).map(f =>
+            `${icons[f.severity] || '⚪'} **${(f.severity||'info').toUpperCase()}**: ${f.title} (\`${f.file}${f.line ? ':'+f.line : ''}\`)`
+          );
+          if (findings.length > 20) lines.push(`... and ${findings.length - 20} more`);
+          findingsMd = lines.join('\n');
+        }
 
-        QUOTA_MD=$(node -e "
-        const r = JSON.parse(require('fs').readFileSync('/tmp/scan_result.json','utf8'));
+        let quotaMd = '';
         const q = r.quota || {};
-        if (q.source === 'tokens') process.stdout.write('_Scan paid with 1 token. Balance: ' + q.token_balance + ' tokens remaining._');
-        else if (q.source === 'plan') process.stdout.write('_Plan scan. ' + q.remaining_plan + ' free scans remaining this month._');
-        else process.stdout.write('');
-        ")
+        if (q.source === 'tokens') quotaMd = `_Scan paid with 1 token. Balance: ${q.token_balance} tokens remaining._`;
+        else if (q.source === 'plan') quotaMd = `_Plan scan. ${q.remaining_plan} free scans remaining this month._`;
 
-        COMMENT=$(cat <<ZFEOF
-        ## $STATUS_ICON ZeriFlow Security Scan — $STATUS_TEXT
+        const comment = `## ${statusIcon} ZeriFlow Security Scan — ${statusText}
 
-        **Score: $SCORE/100** | Threshold: $THRESHOLD | $CRITICAL critical · $WARNING warnings · $INFO info
+**Score: ${score}/100** | Threshold: ${threshold} | ${critical} critical · ${warning} warnings · ${info} info
 
-        $SUMMARY
+${summary}
 
-        ### Findings
+### Findings
 
-        $FINDINGS_MD
+${findingsMd}
 
-        ---
-        $QUOTA_MD
-        [View full report](https://zeriflow.com/dashboard/ci/scan/$SCAN_ID) · Powered by [ZeriFlow](https://zeriflow.com)
-        ZFEOF
-        )
+---
+${quotaMd}
+[View full report](https://zeriflow.com/dashboard/ci/scan/${scanId}) · Powered by [ZeriFlow](https://zeriflow.com)`;
 
-        EXISTING_COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --jq '.[] | select(.body | startswith("## ✅ ZeriFlow") or startswith("## ❌ ZeriFlow")) | .id' 2>/dev/null | head -1)
+        // Check for existing comment to update
+        const prNumber = process.env.PR_NUMBER;
+        const repo = process.env.REPO;
+        try {
+          const existing = execSync(
+            `gh api "repos/${repo}/issues/${prNumber}/comments" --jq '.[] | select(.body | startswith("## ✅ ZeriFlow") or startswith("## ❌ ZeriFlow")) | .id' 2>/dev/null`,
+            { encoding: 'utf8' }
+          ).trim().split('\n')[0];
 
-        if [ -n "$EXISTING_COMMENT_ID" ]; then
-          gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_COMMENT_ID" -X PATCH -f body="$COMMENT" 2>/dev/null || true
-        else
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$COMMENT" 2>/dev/null || true
-        fi
+          if (existing) {
+            execSync(`gh api "repos/${repo}/issues/comments/${existing}" -X PATCH -f body=@-`, { input: comment });
+          } else {
+            execSync(`gh pr comment ${prNumber} --body-file -`, { input: comment });
+          }
+        } catch {
+          try { execSync(`gh pr comment ${prNumber} --body-file -`, { input: comment }); } catch {}
+        }
+        console.log('PR comment posted');
+        NODESCRIPT
 
-    # Step 7: Check result
     - name: Check result
       shell: bash
       run: |
