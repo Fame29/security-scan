@@ -151,16 +151,13 @@ runs:
       env:
         ZERIFLOW_API_KEY: ${{ inputs.api-key }}
       run: |
-        PACKAGE_JSON="null"
-        if [ -f package.json ]; then
-          PACKAGE_JSON=$(cat package.json)
-        fi
-
         PR_TITLE="${{ github.event.pull_request.title }}"
         PR_TITLE_ESCAPED=$(node -e "process.stdout.write(JSON.stringify(process.argv[1]))" -- "$PR_TITLE")
 
         PAYLOAD=$(node -e "
         const fs = require('fs');
+        let pkgJson = null;
+        try { pkgJson = JSON.parse(fs.readFileSync('package.json', 'utf8')); } catch {}
         const payload = {
           pr_number: ${{ github.event.pull_request.number || 0 }},
           pr_title: $PR_TITLE_ESCAPED,
@@ -172,7 +169,7 @@ runs:
             gitleaks: JSON.parse(fs.readFileSync('/tmp/gitleaks_results.json', 'utf8')),
             npm_audit: JSON.parse(fs.readFileSync('/tmp/npm_audit_results.json', 'utf8'))
           },
-          package_json: ${PACKAGE_JSON === "null" ? "null" : "JSON.parse(fs.readFileSync('package.json', 'utf8'))"},
+          package_json: pkgJson,
           framework_detected: '${{ steps.framework.outputs.framework }}'
         };
         process.stdout.write(JSON.stringify(payload));
