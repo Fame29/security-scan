@@ -259,19 +259,21 @@ runs:
         if (q.source === 'tokens') quotaMd = `_Scan paid with 1 token. Balance: ${q.token_balance} tokens remaining._`;
         else if (q.source === 'plan') quotaMd = `_Plan scan. ${q.remaining_plan} free scans remaining this month._`;
 
-        const comment = `## ${statusIcon} ZeriFlow Security Scan — ${statusText}
-
-**Score: ${score}/100** | Threshold: ${threshold} | ${critical} critical · ${warning} warnings · ${info} info
-
-${summary}
-
-### Findings
-
-${findingsMd}
-
----
-${quotaMd}
-[View full report](https://zeriflow.com/dashboard/ci/scan/${scanId}) · Powered by [ZeriFlow](https://zeriflow.com)`;
+        const comment = [
+          '## ' + statusIcon + ' ZeriFlow Security Scan — ' + statusText,
+          '',
+          '**Score: ' + score + '/100** | Threshold: ' + threshold + ' | ' + critical + ' critical · ' + warning + ' warnings · ' + info + ' info',
+          '',
+          summary,
+          '',
+          '### Findings',
+          '',
+          findingsMd,
+          '',
+          '---',
+          quotaMd,
+          '[View full report](https://zeriflow.com/dashboard/ci/scan/' + scanId + ') · Powered by [ZeriFlow](https://zeriflow.com)'
+        ].join('\n');
 
         // Check for existing comment to update
         const prNumber = process.env.PR_NUMBER;
