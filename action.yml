@@ -174,7 +174,7 @@ runs:
 
         API_URL="${INPUT_API_URL}"
         if [ -z "$API_URL" ]; then
-          API_URL="https://nkkfvjqcbniylnwmviyf.supabase.co/functions/v1/ci-scan"
+          API_URL="https://nbfspfjbqggsrsslkrxx.supabase.co/functions/v1/ci-scan"
         fi
 
         echo "Sending to $API_URL ..."
